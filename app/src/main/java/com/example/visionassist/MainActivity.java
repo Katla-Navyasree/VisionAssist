@@ -13,19 +13,30 @@ import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.Preview;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+
+import com.google.common.util.concurrent.ListenableFuture;
 
 import java.util.ArrayList;
 import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
 
-    private static final int RECORD_AUDIO_PERMISSION_CODE = 1;
+    private static final int PERMISSIONS_REQUEST_CODE = 1;
+    private static final String[] REQUIRED_PERMISSIONS = {
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.CAMERA
+    };
 
     private SpeechRecognizer speechRecognizer;
     private TextToSpeech textToSpeech;
     private Button micButton;
+    private PreviewView cameraPreview;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -33,8 +44,8 @@ public class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         micButton = findViewById(R.id.micButton);
+        cameraPreview = findViewById(R.id.cameraPreview);
 
-        // Set up Text-to-Speech
         textToSpeech = new TextToSpeech(this, status -> {
             if (status == TextToSpeech.SUCCESS) {
                 textToSpeech.setLanguage(Locale.US);
@@ -42,14 +53,44 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
-        // Ask for mic permission if we don't have it yet
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this,
-                    new String[]{Manifest.permission.RECORD_AUDIO}, RECORD_AUDIO_PERMISSION_CODE);
+        if (!allPermissionsGranted()) {
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, PERMISSIONS_REQUEST_CODE);
+        } else {
+            startCamera();
         }
 
         micButton.setOnClickListener(v -> startListening());
+    }
+
+    private boolean allPermissionsGranted() {
+        for (String permission : REQUIRED_PERMISSIONS) {
+            if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void startCamera() {
+        ListenableFuture<ProcessCameraProvider> cameraProviderFuture =
+                ProcessCameraProvider.getInstance(this);
+
+        cameraProviderFuture.addListener(() -> {
+            try {
+                ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
+
+                Preview preview = new Preview.Builder().build();
+                preview.setSurfaceProvider(cameraPreview.getSurfaceProvider());
+
+                CameraSelector cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA;
+
+                cameraProvider.unbindAll();
+                cameraProvider.bindToLifecycle(this, cameraSelector, preview);
+
+            } catch (Exception e) {
+                Toast.makeText(this, "Camera failed to start: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            }
+        }, ContextCompat.getMainExecutor(this));
     }
 
     private void startListening() {
@@ -71,12 +112,10 @@ public class MainActivity extends AppCompatActivity {
                 ArrayList<String> matches = results.getStringArrayList(
                         SpeechRecognizer.RESULTS_RECOGNITION);
                 if (matches != null && !matches.isEmpty()) {
-                    String spokenText = matches.get(0);
-                    handleCommand(spokenText);
+                    handleCommand(matches.get(0));
                 }
             }
 
-            // Required overrides we don't need to act on yet
             @Override public void onReadyForSpeech(Bundle params) {}
             @Override public void onBeginningOfSpeech() {}
             @Override public void onRmsChanged(float rmsdB) {}
@@ -93,8 +132,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void handleCommand(String spokenText) {
-        // For now, just repeat back what it heard — this proves the full loop works.
-        // Later, this is where we'll parse commands like "start", "stop", "emergency".
         textToSpeech.speak("You said: " + spokenText, TextToSpeech.QUEUE_FLUSH, null, null);
     }
 
@@ -102,11 +139,11 @@ public class MainActivity extends AppCompatActivity {
     public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
                                            @NonNull int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == RECORD_AUDIO_PERMISSION_CODE) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                Toast.makeText(this, "Mic permission granted", Toast.LENGTH_SHORT).show();
+        if (requestCode == PERMISSIONS_REQUEST_CODE) {
+            if (allPermissionsGranted()) {
+                startCamera();
             } else {
-                Toast.makeText(this, "App needs mic permission to work", Toast.LENGTH_LONG).show();
+                Toast.makeText(this, "Camera and microphone permissions are required", Toast.LENGTH_LONG).show();
             }
         }
     }
