@@ -26,10 +26,6 @@ import androidx.core.content.ContextCompat;
 
 import com.google.common.util.concurrent.ListenableFuture;
 
-import org.tensorflow.lite.support.image.TensorImage;
-import org.tensorflow.lite.task.vision.detector.Detection;
-import org.tensorflow.lite.task.vision.detector.ObjectDetector;
-
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -48,13 +44,13 @@ public class MainActivity extends AppCompatActivity {
     // Fast enough to catch obstacles in time, light enough on the battery.
     private static final long DETECTION_INTERVAL_MS = 400;
     // Don't speak a new announcement more often than this, so TTS doesn't spam.
-    private static final long ANNOUNCEMENT_INTERVAL_MS = 3000;
+    private static final long ANNOUNCEMENT_INTERVAL_MS = 4500;
 
     private SpeechRecognizer speechRecognizer;
     private TextToSpeech textToSpeech;
     private Button micButton;
     private PreviewView cameraPreview;
-    private ObjectDetector objectDetector;
+    private ObjectDetectorHelper objectDetector;
     private ExecutorService cameraExecutor;
     private android.widget.TextView debugText;
     private boolean isDetecting = false;
@@ -78,6 +74,16 @@ public class MainActivity extends AppCompatActivity {
             }
         });
 
+        textToSpeech.setOnUtteranceProgressListener(new android.speech.tts.UtteranceProgressListener() {
+            @Override public void onStart(String utteranceId) {}
+            @Override public void onDone(String utteranceId) {
+                if ("start_utterance".equals(utteranceId)) {
+                    isDetecting = true; // only actually begin detecting AFTER "Detection started" finishes speaking
+                }
+            }
+            @Override public void onError(String utteranceId) {}
+        });
+
         setupObjectDetector();
 
         if (!allPermissionsGranted()) {
@@ -91,13 +97,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void setupObjectDetector() {
         try {
-            ObjectDetector.ObjectDetectorOptions options =
-                    ObjectDetector.ObjectDetectorOptions.builder()
-                            .setMaxResults(3)
-                            .setScoreThreshold(0.5f)
-                            .build();
-            objectDetector = ObjectDetector.createFromFileAndOptions(
-                    this, "detection_model.tflite", options);
+            objectDetector = new ObjectDetectorHelper(this, "detection_model.tflite", "labelmap.txt");
         } catch (Exception e) {
             Toast.makeText(this, "Failed to load detection model: " + e.getMessage(),
                     Toast.LENGTH_LONG).show();
@@ -154,8 +154,7 @@ public class MainActivity extends AppCompatActivity {
 
         try {
             Bitmap bitmap = ImageUtils.imageProxyToBitmap(imageProxy);
-            TensorImage tensorImage = TensorImage.fromBitmap(bitmap);
-            List<Detection> results = objectDetector.detect(tensorImage);
+            List<ObjectDetectorHelper.DetectionResult> results = objectDetector.detect(bitmap);
             handleDetections(results, bitmap.getWidth(), bitmap.getHeight());
         } catch (Exception e) {
             // Don't crash the app on a bad frame - just skip it.
@@ -164,23 +163,19 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void handleDetections(List<Detection> results, int imageWidth, int imageHeight) {
+    private void handleDetections(List<ObjectDetectorHelper.DetectionResult> results, int imageWidth, int imageHeight) {
         if (results == null || results.isEmpty()) return;
 
         long currentTime = System.currentTimeMillis();
         if ((currentTime - lastAnnouncementTime) < ANNOUNCEMENT_INTERVAL_MS) return;
 
-        // Just announce the top (most confident) detection for now.
-        Detection top = results.get(0);
-        if (top.getCategories().isEmpty()) return;
+        ObjectDetectorHelper.DetectionResult top = results.get(0);
+        RectF box = top.boundingBox;
 
-        String label = top.getCategories().get(0).getLabel();
-        RectF box = top.getBoundingBox();
+        String direction = estimateDirection(box);
+        String distance = estimateDistance(box);
 
-        String direction = estimateDirection(box, imageWidth);
-        String distance = estimateDistance(box, imageHeight);
-
-        String message = distance + " " + label + " " + direction;
+        String message = distance + " " + top.label + " " + direction;
         textToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, null, null);
         lastAnnouncementTime = currentTime;
 
@@ -188,15 +183,15 @@ public class MainActivity extends AppCompatActivity {
         runOnUiThread(() -> debugText.setText(debugMessage));
     }
 
-    private String estimateDirection(RectF box, int imageWidth) {
-        float centerX = box.centerX();
-        if (centerX < imageWidth / 3.0) return "on your left";
-        if (centerX > imageWidth * 2.0 / 3.0) return "on your right";
+    private String estimateDirection(RectF box) {
+        float centerX = box.centerX(); // already normalized 0-1
+        if (centerX < 0.33) return "on your left";
+        if (centerX > 0.66) return "on your right";
         return "ahead";
     }
 
-    private String estimateDistance(RectF box, int imageHeight) {
-        float boxHeightFraction = box.height() / imageHeight;
+    private String estimateDistance(RectF box) {
+        float boxHeightFraction = box.height(); // already normalized 0-1
         if (boxHeightFraction > 0.5) return "Close,";
         if (boxHeightFraction > 0.25) return "Nearby,";
         return "Far,";
@@ -209,10 +204,13 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        if (speechRecognizer != null) {
-            speechRecognizer.destroy();  // clean up the previous instance first
+        if (textToSpeech.isSpeaking()) {
+            textToSpeech.stop(); // clear the speaker immediately so it doesn't bleed into the mic
         }
 
+        if (speechRecognizer != null) {
+            speechRecognizer.destroy();
+        }
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
 
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
@@ -248,13 +246,13 @@ public class MainActivity extends AppCompatActivity {
         String command = spokenText.toLowerCase(Locale.US);
 
         if (command.contains("start")) {
-            isDetecting = true;
-            textToSpeech.speak("Detection started", TextToSpeech.QUEUE_FLUSH, null, null);
+            isDetecting = false; // make sure no detection runs during the announcement itself
+            textToSpeech.speak("Detection started", TextToSpeech.QUEUE_FLUSH, null, "start_utterance");
         } else if (command.contains("stop")) {
             isDetecting = false;
-            textToSpeech.speak("Detection stopped", TextToSpeech.QUEUE_FLUSH, null, null);
+            textToSpeech.speak("Detection stopped", TextToSpeech.QUEUE_FLUSH, null, "stop_utterance");
         } else {
-            textToSpeech.speak("You said: " + spokenText, TextToSpeech.QUEUE_FLUSH, null, null);
+            textToSpeech.speak("You said: " + spokenText, TextToSpeech.QUEUE_FLUSH, null, "generic_utterance");
         }
     }
 
