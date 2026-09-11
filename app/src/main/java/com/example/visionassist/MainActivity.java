@@ -209,6 +209,10 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        if (speechRecognizer != null) {
+            speechRecognizer.destroy();  // clean up the previous instance first
+        }
+
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
 
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
