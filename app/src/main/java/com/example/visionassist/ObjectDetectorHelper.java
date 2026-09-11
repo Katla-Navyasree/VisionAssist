@@ -6,14 +6,13 @@ import android.graphics.Bitmap;
 import android.graphics.RectF;
 
 import org.tensorflow.lite.Interpreter;
-import org.tensorflow.lite.support.image.ImageProcessor;
-import org.tensorflow.lite.support.image.TensorImage;
-import org.tensorflow.lite.support.image.ops.ResizeOp;
 
 import java.io.BufferedReader;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
@@ -23,7 +22,6 @@ import java.util.Map;
 
 public class ObjectDetectorHelper {
 
-    // EfficientDet-Lite0 expects a fixed 320x320 input image.
     private static final int MODEL_INPUT_SIZE = 320;
     private static final int MAX_DETECTIONS = 25;
     private static final float SCORE_THRESHOLD = 0.5f;
@@ -34,7 +32,7 @@ public class ObjectDetectorHelper {
     public static class DetectionResult {
         public final String label;
         public final float confidence;
-        public final RectF boundingBox; // normalized 0-1 coordinates
+        public final RectF boundingBox;
 
         DetectionResult(String label, float confidence, RectF boundingBox) {
             this.label = label;
@@ -69,16 +67,29 @@ public class ObjectDetectorHelper {
         return labelList;
     }
 
-    public List<DetectionResult> detect(Bitmap bitmap) {
-        // Resize the incoming camera frame to exactly what the model expects.
-        ImageProcessor imageProcessor = new ImageProcessor.Builder()
-                .add(new ResizeOp(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, ResizeOp.ResizeMethod.BILINEAR))
-                .build();
-        TensorImage tensorImage = new TensorImage(org.tensorflow.lite.DataType.UINT8);
-        tensorImage.load(bitmap);
-        tensorImage = imageProcessor.process(tensorImage);
+    // Manually resizes the frame and packs it into the raw byte format the model expects.
+    // This replaces what the TensorFlow "Support" library used to do for us.
+    private ByteBuffer bitmapToByteBuffer(Bitmap bitmap) {
+        Bitmap resized = Bitmap.createScaledBitmap(bitmap, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, true);
 
-        // These 4 output arrays are the standard SSD/EfficientDet detection format.
+        ByteBuffer byteBuffer = ByteBuffer.allocateDirect(MODEL_INPUT_SIZE * MODEL_INPUT_SIZE * 3);
+        byteBuffer.order(ByteOrder.nativeOrder());
+
+        int[] pixels = new int[MODEL_INPUT_SIZE * MODEL_INPUT_SIZE];
+        resized.getPixels(pixels, 0, MODEL_INPUT_SIZE, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+
+        for (int pixel : pixels) {
+            byteBuffer.put((byte) ((pixel >> 16) & 0xFF)); // Red
+            byteBuffer.put((byte) ((pixel >> 8) & 0xFF));  // Green
+            byteBuffer.put((byte) (pixel & 0xFF));         // Blue
+        }
+
+        return byteBuffer;
+    }
+
+    public List<DetectionResult> detect(Bitmap bitmap) {
+        ByteBuffer inputBuffer = bitmapToByteBuffer(bitmap);
+
         float[][][] outputBoxes = new float[1][MAX_DETECTIONS][4];
         float[][] outputClasses = new float[1][MAX_DETECTIONS];
         float[][] outputScores = new float[1][MAX_DETECTIONS];
@@ -90,7 +101,7 @@ public class ObjectDetectorHelper {
         outputs.put(2, outputScores);
         outputs.put(3, numDetections);
 
-        interpreter.runForMultipleInputsOutputs(new Object[]{tensorImage.getBuffer()}, outputs);
+        interpreter.runForMultipleInputsOutputs(new Object[]{inputBuffer}, outputs);
 
         List<DetectionResult> results = new ArrayList<>();
         int detectedCount = (int) numDetections[0];
@@ -103,7 +114,6 @@ public class ObjectDetectorHelper {
             String label = (classIndex >= 0 && classIndex < labels.size())
                     ? labels.get(classIndex) : "object";
 
-            // Box format from the model is [top, left, bottom, right], normalized 0-1.
             float top = outputBoxes[0][i][0];
             float left = outputBoxes[0][i][1];
             float bottom = outputBoxes[0][i][2];
