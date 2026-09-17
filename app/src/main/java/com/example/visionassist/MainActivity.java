@@ -40,11 +40,12 @@ public class MainActivity extends AppCompatActivity {
             Manifest.permission.CAMERA
     };
 
-    // Detection will run at roughly this interval - 400ms = ~2.5 frames per second.
-    // Fast enough to catch obstacles in time, light enough on the battery.
-    private static final long DETECTION_INTERVAL_MS = 400;
-    // Don't speak a new announcement more often than this, so TTS doesn't spam.
+    private static final long DETECTION_INTERVAL_MS = 800;
+    // Minimum gap between any two spoken announcements.
     private static final long ANNOUNCEMENT_INTERVAL_MS = 4500;
+    // If the SAME message would repeat, only re-speak it after this much longer
+    // gap - long enough to not spam, short enough that the user knows it's still there.
+    private static final long REPEAT_MESSAGE_INTERVAL_MS = 9000;
 
     private SpeechRecognizer speechRecognizer;
     private TextToSpeech textToSpeech;
@@ -54,8 +55,15 @@ public class MainActivity extends AppCompatActivity {
     private ExecutorService cameraExecutor;
     private android.widget.TextView debugText;
     private boolean isDetecting = false;
+    private boolean isListening = false;
     private long lastAnalyzedTime = 0;
     private long lastAnnouncementTime = 0;
+    private long lastSpokenTime = 0;
+    private String lastSpokenMessage = "";
+    private int frameCounter = 0;
+    private static final long URGENT_ANNOUNCEMENT_INTERVAL_MS = 2000;
+    private List<ObjectDetectorHelper.DetectionResult> latestDetections =
+            new ArrayList<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -76,9 +84,34 @@ public class MainActivity extends AppCompatActivity {
 
         textToSpeech.setOnUtteranceProgressListener(new android.speech.tts.UtteranceProgressListener() {
             @Override public void onStart(String utteranceId) {}
-            @Override public void onDone(String utteranceId) {
+            @Override
+            public void onDone(String utteranceId) {
+
                 if ("start_utterance".equals(utteranceId)) {
-                    isDetecting = true; // only actually begin detecting AFTER "Detection started" finishes speaking
+                    isDetecting = true;
+                    isListening = false;
+                }
+
+                if ("stop_utterance".equals(utteranceId)) {
+                    isListening = false;
+                }
+
+                if ("ahead_answer".equals(utteranceId)) {
+                    isListening = false;
+                }
+
+                if ("generic_utterance".equals(utteranceId)) {
+                    isListening = false;
+                }
+
+                if ("retry_utterance".equals(utteranceId)) {
+                    isListening = false;
+                }
+
+                // Only start actually listening AFTER the "Listening" prompt
+                // finishes speaking, so the mic doesn't pick up our own TTS.
+                if ("listening_prompt".equals(utteranceId)) {
+                    runOnUiThread(MainActivity.this::beginSpeechRecognition);
                 }
             }
             @Override public void onError(String utteranceId) {}
@@ -97,7 +130,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void setupObjectDetector() {
         try {
-            objectDetector = new ObjectDetectorHelper(this, "detection_model.tflite", "labelmap.txt");
+            objectDetector = new ObjectDetectorHelper(this, "yolov5n.tflite", "labelmap.txt");
         } catch (Exception e) {
             Toast.makeText(this, "Failed to load detection model: " + e.getMessage(),
                     Toast.LENGTH_LONG).show();
@@ -140,14 +173,15 @@ public class MainActivity extends AppCompatActivity {
         }, ContextCompat.getMainExecutor(this));
     }
 
-    // This runs on every camera frame - but we throttle it so we only actually
-    // process a frame every DETECTION_INTERVAL_MS, to save battery and CPU.
     private void analyzeFrame(ImageProxy imageProxy) {
+        frameCounter++;
+
         long currentTime = System.currentTimeMillis();
 
         if (!isDetecting || objectDetector == null
+                || frameCounter % 5 != 0
                 || (currentTime - lastAnalyzedTime) < DETECTION_INTERVAL_MS) {
-            imageProxy.close(); // must always close, or the camera pipeline stalls
+            imageProxy.close();
             return;
         }
         lastAnalyzedTime = currentTime;
@@ -155,9 +189,11 @@ public class MainActivity extends AppCompatActivity {
         try {
             Bitmap bitmap = ImageUtils.imageProxyToBitmap(imageProxy);
             List<ObjectDetectorHelper.DetectionResult> results = objectDetector.detect(bitmap);
+            latestDetections = results;
             handleDetections(results, bitmap.getWidth(), bitmap.getHeight());
         } catch (Exception e) {
-            // Don't crash the app on a bad frame - just skip it.
+            e.printStackTrace();
+            runOnUiThread(() -> debugText.setText("Detection error: " + e.getMessage()));
         } finally {
             imageProxy.close();
         }
@@ -165,36 +201,123 @@ public class MainActivity extends AppCompatActivity {
 
     private void handleDetections(List<ObjectDetectorHelper.DetectionResult> results, int imageWidth, int imageHeight) {
         if (results == null || results.isEmpty()) return;
+        if (isListening) return;
+
+        // Announce the most URGENT object (closest), not just the most confident one -
+        // this is what makes the safe-path suggestion line up with what's actually said.
+        ObjectDetectorHelper.DetectionResult top = pickPriorityDetection(results);
+        RectF box = top.boundingBox;
+
+        // React faster when the priority object is genuinely close, instead of
+        // waiting on the same fixed interval used for far-away objects.
+        boolean topIsClose = box.height() > 0.5f;
+        long requiredGap = topIsClose ? URGENT_ANNOUNCEMENT_INTERVAL_MS : ANNOUNCEMENT_INTERVAL_MS;
 
         long currentTime = System.currentTimeMillis();
-        if ((currentTime - lastAnnouncementTime) < ANNOUNCEMENT_INTERVAL_MS) return;
-
-        ObjectDetectorHelper.DetectionResult top = results.get(0);
-        RectF box = top.boundingBox;
+        if ((currentTime - lastAnnouncementTime) < requiredGap) return;
 
         String direction = estimateDirection(box);
         String distance = estimateDistance(box);
-
         String message = distance + " " + top.label + " " + direction;
-        textToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, null, null);
+
+        boolean anyCloseOrNearby = false;
+        for (ObjectDetectorHelper.DetectionResult d : results) {
+            if (d.boundingBox.height() > 0.25f) {
+                anyCloseOrNearby = true;
+                break;
+            }
+        }
+
+        if (anyCloseOrNearby) {
+            String safePath = computeSafePath(results);
+            if (safePath != null) {
+                message = message + ". " + safePath;
+            }
+        }
+
+        boolean sameAsLast = message.equals(lastSpokenMessage);
+        boolean repeatWindowElapsed = (currentTime - lastSpokenTime) >= REPEAT_MESSAGE_INTERVAL_MS;
+
         lastAnnouncementTime = currentTime;
+
+        if (sameAsLast && !repeatWindowElapsed) {
+            return;
+        }
+
+        lastSpokenTime = currentTime;
+        lastSpokenMessage = message;
+
+        textToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, null, null);
 
         final String debugMessage = message;
         runOnUiThread(() -> debugText.setText(debugMessage));
     }
 
     private String estimateDirection(RectF box) {
-        float centerX = box.centerX(); // already normalized 0-1
+        float centerX = box.centerX();
         if (centerX < 0.33) return "on your left";
         if (centerX > 0.66) return "on your right";
         return "ahead";
     }
 
     private String estimateDistance(RectF box) {
-        float boxHeightFraction = box.height(); // already normalized 0-1
+        float boxHeightFraction = box.height();
         if (boxHeightFraction > 0.5) return "Close,";
         if (boxHeightFraction > 0.25) return "Nearby,";
         return "Far,";
+    }
+
+    // Looks at every detected object this frame (not just the closest one) and figures out
+// which third of the view - left, center, right - is safest to move toward.
+// Returns null if the center is actually clear and no path suggestion is needed.
+    private String computeSafePath(List<ObjectDetectorHelper.DetectionResult> results) {
+        float leftMaxHeight = 0f;
+        float centerMaxHeight = 0f;
+        float rightMaxHeight = 0f;
+
+        for (ObjectDetectorHelper.DetectionResult d : results) {
+            float cx = d.boundingBox.centerX();
+            float h = d.boundingBox.height();
+
+            if (cx < 0.33f) {
+                leftMaxHeight = Math.max(leftMaxHeight, h);
+            } else if (cx > 0.66f) {
+                rightMaxHeight = Math.max(rightMaxHeight, h);
+            } else {
+                centerMaxHeight = Math.max(centerMaxHeight, h);
+            }
+        }
+
+        boolean centerBlocked = centerMaxHeight > 0.25f;
+        if (!centerBlocked) {
+            return "Path ahead is clear"; // CHANGED: was `return null;`
+        }
+
+        boolean leftBlocked = leftMaxHeight > 0.25f;
+        boolean rightBlocked = rightMaxHeight > 0.25f;
+
+        if (!leftBlocked && !rightBlocked) {
+            return (leftMaxHeight <= rightMaxHeight) ? "Move left" : "Move right";
+        } else if (!leftBlocked) {
+            return "Move left";
+        } else if (!rightBlocked) {
+            return "Move right";
+        } else {
+            return "Stop, path blocked on all sides";
+        }
+    }
+
+    // Picks the object to announce based on urgency (how close it is), not raw
+// model confidence. NMS already sorted 'results' by confidence, but the most
+// confident detection isn't necessarily the one that's about to be walked into.
+    private ObjectDetectorHelper.DetectionResult pickPriorityDetection(List<ObjectDetectorHelper.DetectionResult> results) {
+        ObjectDetectorHelper.DetectionResult best = null;
+        for (ObjectDetectorHelper.DetectionResult d : results) {
+            if (best == null || d.boundingBox.height() > best.boundingBox.height()) {
+                best = d;
+            }
+        }
+        return best;
     }
 
     private void startListening() {
@@ -204,26 +327,24 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        isListening = true;
+
         if (textToSpeech.isSpeaking()) {
-            textToSpeech.stop(); // clear the speaker immediately so it doesn't bleed into the mic
+            textToSpeech.stop();
         }
 
         if (speechRecognizer != null) {
             speechRecognizer.destroy();
         }
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
-
-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US);
-
         speechRecognizer.setRecognitionListener(new RecognitionListener() {
             @Override public void onResults(Bundle results) {
                 ArrayList<String> matches = results.getStringArrayList(
                         SpeechRecognizer.RESULTS_RECOGNITION);
                 if (matches != null && !matches.isEmpty()) {
                     handleCommand(matches.get(0));
+                } else {
+                    speakRetry();
                 }
             }
 
@@ -233,26 +354,86 @@ public class MainActivity extends AppCompatActivity {
             @Override public void onBufferReceived(byte[] buffer) {}
             @Override public void onEndOfSpeech() {}
             @Override public void onError(int error) {
-                Toast.makeText(MainActivity.this, "Didn't catch that, try again", Toast.LENGTH_SHORT).show();
+                speakRetry();
             }
             @Override public void onPartialResults(Bundle partialResults) {}
             @Override public void onEvent(int eventType, Bundle params) {}
         });
 
+        // Say "Listening" first; the actual mic opens once this finishes
+        // (see the "listening_prompt" case in onDone above).
+        textToSpeech.speak("Listening", TextToSpeech.QUEUE_FLUSH, null, "listening_prompt");
+    }
+
+    private void beginSpeechRecognition() {
+        if (speechRecognizer == null) return;
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US);
         speechRecognizer.startListening(intent);
     }
 
+    private void speakRetry() {
+        textToSpeech.speak("Sorry, I didn't catch that. Please try again.",
+                TextToSpeech.QUEUE_FLUSH, null, "retry_utterance");
+        runOnUiThread(() -> debugText.setText("Didn't catch that - try again"));
+    }
+
     private void handleCommand(String spokenText) {
-        String command = spokenText.toLowerCase(Locale.US);
+        String command = spokenText.toLowerCase(Locale.US).trim();
+
+        android.util.Log.d("VOICE_CMD", "Recognized: '" + command + "'");
 
         if (command.contains("start")) {
-            isDetecting = false; // make sure no detection runs during the announcement itself
+            isListening = false;
+            isDetecting = false;
             textToSpeech.speak("Detection started", TextToSpeech.QUEUE_FLUSH, null, "start_utterance");
+
         } else if (command.contains("stop")) {
+            isListening = false;
             isDetecting = false;
             textToSpeech.speak("Detection stopped", TextToSpeech.QUEUE_FLUSH, null, "stop_utterance");
+
+        } else if (command.contains("ahead")
+                || command.contains("in front")
+                || command.contains("front of me")
+                || (command.contains("what") && command.contains("head"))) {
+
+            answerWhatIsAhead();
+
         } else {
             textToSpeech.speak("You said: " + spokenText, TextToSpeech.QUEUE_FLUSH, null, "generic_utterance");
+            isListening = false;
+        }
+    }
+
+    private void answerWhatIsAhead() {
+
+        if (latestDetections == null || latestDetections.isEmpty()) {
+            textToSpeech.speak("I don't see anything ahead.", TextToSpeech.QUEUE_FLUSH, null, "ahead_answer");
+            return;
+        }
+
+        ObjectDetectorHelper.DetectionResult closestAhead = null;
+
+        for (ObjectDetectorHelper.DetectionResult detection : latestDetections) {
+            RectF box = detection.boundingBox;
+            float centerX = box.centerX();
+
+            if (centerX >= 0.33f && centerX <= 0.66f) {
+                if (closestAhead == null || box.height() > closestAhead.boundingBox.height()) {
+                    closestAhead = detection;
+                }
+            }
+        }
+
+        if (closestAhead == null) {
+            textToSpeech.speak("I don't see anything directly ahead.", TextToSpeech.QUEUE_FLUSH, null, "ahead_answer");
+        } else {
+            String distance = estimateDistance(closestAhead.boundingBox);
+            String message = "There is a " + closestAhead.label + " " + distance + " ahead.";
+            textToSpeech.speak(message, TextToSpeech.QUEUE_FLUSH, null, "ahead_answer");
         }
     }
 
